@@ -1,19 +1,22 @@
 import socket
+import ssl
 import subprocess
 import os
 import sys
+import struct
 import time
 import json
-import struct
 
 # --- CONFIGURATION ---
-HOST = '0.0.0.0'
-PORT = 4443       # The port your SSL tunnel forwards to
-DISK_DEVICE = '/dev/vda' # ⚠️ VERIFY THIS PATH ON YOUR DIGITAL OCEAN DROPLET!
-SECRET_AUTH_TOKEN = 'your_super_secret_clone_key_12345' # ⚠️ CHANGE THIS!
-REQUEST_METHOD = 'clone_disk'
+HOST = '0.0.0.0'  # Listen on all interfaces
+PORT = 4443       # Choose a high port for security
+DISK_DEVICE = '/dev/sda1' # ⚠️ VERIFY THIS PATH ON YOUR DIGITAL OCEAN DROPLET!
+SECRET_AUTH_TOKEN = '!coxYocvmhLMhRsn=30a0a5@' # ⚠️ CHANGE THIS!
 
-# --- Protocol Helpers ---
+# --- CONSTANTS ---
+REQUEST_METHOD = 'CLONE_DISK'
+HEADER_SEPARATOR = b'\n'
+
 BUFFER_SIZE = 8192
 MAX_HEADER_SIZE = 4096
 
@@ -51,32 +54,23 @@ def send_error(sock, message):
     except Exception as e:
         print(f"Failed to send error response: {e}")
 
-# --- MAIN SERVER CLASS ---
 
 class DiskStreamerServer:
     
-    def __init__(self, host, port, disk_device, auth_token):
-        """Initializes server configuration."""
+    def __init__(self, host, port, certfile, keyfile, disk_device, auth_token):
+        """Initializes the server with networking and security parameters."""
         self.host = host
         self.port = port
+        self.certfile = certfile
+        self.keyfile = keyfile
         self.disk_device = disk_device
         self.auth_token = auth_token
+        self.server_socket = None
 
-    def _auth_and_process_request(self, client_sock):
+    def _process_json_request(self, client_sock, json_data):
         """Receives the length-prefixed JSON request and validates it."""
         try:
-            # 1. Receive the 4-byte length prefix
-            json_len = recv_header(client_sock)
-            if json_len is None:
-                print("Client disconnected during header read.")
-                return False
-                
-            if json_len > MAX_HEADER_SIZE:
-                 send_error(client_sock, "Request header too large.")
-                 return False
-
-            # 2. Receive the JSON payload
-            json_data = receive_all(client_sock, json_len)
+          
             if json_data is None:
                 print("Client disconnected during payload read.")
                 return False
@@ -97,6 +91,7 @@ class DiskStreamerServer:
                 send_error(client_sock, "Unauthorized: Invalid secret key.")
                 return False
 
+
             # 5. Send success acknowledgment (crucial before streaming starts)
             success_response = json.dumps({"result": "Streaming started", "error": None}).encode('utf-8')
             length_prefix = struct.pack('!I', len(success_response))
@@ -111,35 +106,66 @@ class DiskStreamerServer:
             send_error(client_sock, "Internal server error during request processing.")
             return False
 
-    def _stream_disk_content(self, client_sock):
-        """Executes 'dd' and streams its raw output to the client."""
-        if os.geteuid() != 0:
-            print("❌ ERROR: Stream failed. Not running as root.")
-            return
+    def _auth_and_process_request(self, ssl_sock):
+        """
+        Receives the client request, validates the command and authentication.
+        """
+        print("Waiting for client command...")
+        
+        json_len = recv_header(ssl_sock)
 
+        if json_len is None:
+            print("Client disconnected during header read.")
+            return False
+                
+        if json_len > MAX_HEADER_SIZE:
+            send_error(ssl_sock, "Request header too large.")
+            return False
+                
+        # 1. Receive the request (The Header)
+        json_data = receive_all(ssl_sock, json_len)
+        
+
+        if not self._process_json_request(ssl_sock, json_data) :
+            print("Client disconnected during payload read.")
+            return False
+                
+        return True
+            
+        
+    def _stream_disk_content(self, ssl_sock):
+        """
+        Executes 'dd' and streams its output to the client via SSL socket.
+        """
+        print(f"Starting disk stream of {self.disk_device}...")
+        
+        # Notify the client that streaming is starting (a simple ACK)
+        ssl_sock.sendall(b'ACK:STREAMING_START\n')
+        
+        # Use 'dd' to read the raw device. 'bs=1M' for speed.
         command = ['dd', 'if=' + self.disk_device, 'bs=1M', 'status=none']
         
         try:
-            # Start dd process
             dd_process = subprocess.Popen(
-                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
             )
 
-            chunk_size = 65536
+            chunk_size = 65536  # 64 KB chunk for socket efficiency
             bytes_sent = 0
             start_time = time.time()
             
-            # Start Streaming Loop
             while True:
                 data = dd_process.stdout.read(chunk_size)
                 if not data:
                     break
                 
-                # Send raw disk bytes directly
-                client_sock.sendall(data) 
+                ssl_sock.sendall(data)
                 bytes_sent += len(data)
 
-                if bytes_sent % (100 * 1024 * 1024) == 0: 
+                # Basic progress indication
+                if bytes_sent % (50 * 1024 * 1024) == 0: # Every 50 MB
                     elapsed = time.time() - start_time
                     speed = (bytes_sent / (1024*1024)) / elapsed if elapsed > 0 else 0
                     sys.stdout.write(f"Streaming... Sent: {bytes_sent / (1024*1024*1024):.2f} GB | Speed: {speed:.2f} MB/s\r")
@@ -149,67 +175,92 @@ class DiskStreamerServer:
             
             if dd_process.returncode != 0:
                 error_output = dd_process.stderr.read().decode('utf-8', errors='ignore')
-                print(f"\n‼️ dd failed: {error_output}")
+                print(f"\nERROR: dd command failed (Code: {dd_process.returncode}): {error_output}")
             else:
-                print(f"\n✅ Stream complete. Total size sent: {bytes_sent / (1024*1024*1024):.2f} GB")
+                print(f"\n✅ Stream complete. Total bytes sent: {bytes_sent} ({bytes_sent / (1024*1024*1024):.2f} GB)")
 
         except Exception as e:
             print(f"\nFATAL STREAMING ERROR: {e}")
             
         finally:
-            # CRITICAL: Close the socket to signal End-Of-File (EOF) to the client.
-            client_sock.close()
+            # Crucial: Close the socket to signal EOF to the client.
+            ssl_sock.close()
             print("Connection closed.")
 
+
     def start(self):
-        """Sets up the TCP listener and handles incoming connections."""
+        """Sets up the TCP listener, wraps it with SSL, and handles connections."""
+        # Check for root privilege
         if os.geteuid() != 0:
-            print("❌ ERROR: This server must be run with root privileges.")
+            print("❌ ERROR: This server must be run with root privileges to access the disk device.")
             sys.exit(1)
             
-        print(f"Starting plain TCP server on {self.host}:{self.port}...")
+        print(f"Attempting to start server on {self.host}:{self.port}...")
         
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_socket.bind((self.host, self.port))
-        server_socket.listen(5)
+        # 1. Create the plain TCP socket
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind((self.host, self.port))
+        self.server_socket.listen(5)
         
-        print(f"TCP socket listening. Awaiting client connection...")
+        print(f"TCP socket listening. Awaiting SSL client connection...")
+        
+        # 2. Prepare the SSL context
+        # 
+        ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ssl_context.load_cert_chain(certfile=self.certfile, keyfile=self.keyfile)
         
         while True:
             client_sock = None
+            ssl_sock = None
             try:
-                # Accept the plain TCP connection
-                client_sock, client_addr = server_socket.accept()
+                # 3. Accept the plain TCP connection
+                client_sock, client_addr = self.server_socket.accept()
                 print(f"\nIncoming connection from {client_addr}")
                 
-                # Process the JSON request and authenticate
-                if self._auth_and_process_request(client_sock):
-                    # Start raw binary streaming immediately after the JSON ACK
-                    self._stream_disk_content(client_sock)
+                # 4. Wrap the socket for SSL handshake (Non-blocking by default)
+                ssl_sock = ssl_context.wrap_socket(client_sock, server_side=True)
+                print("SSL handshake successful.")
+
+                # 5. Authenticate and process request
+                if self._auth_and_process_request(ssl_sock):
+                    # 6. If authenticated, start streaming
+                    self._stream_disk_content(ssl_sock)
                 else:
-                    # If auth fails, close the socket (handled by finally block)
-                    pass
+                    # If auth fails, close the socket quickly
+                    print("Request rejected. Closing connection.")
+                    ssl_sock.close()
                     
+            except ssl.SSLError as e:
+                print(f"SSL Error during connection: {e}. Closing socket.")
             except ConnectionResetError:
-                print("Client forcibly closed the connection.")
+                print("Client reset the connection.")
             except Exception as e:
                 print(f"An unexpected error occurred: {e}")
+            except KeyboardInterrupt:
+                print(f"Operation terminated by user! Exiting..")
             finally:
-                if client_sock:
-                    try: client_sock.close() 
+                if ssl_sock:
+                    try: ssl_sock.close() 
+                    except: pass
+                elif ssl_sock:
+                    try: ssl_sock.close() 
                     except: pass
 
 # --- EXECUTION ---
 if __name__ == '__main__':
-    # Initial check for root is done in the start method, but good to check early too.
-    if os.geteuid() != 0:
-        print("Please run this script with 'sudo'.")
-    
-    server = DiskStreamerServer(
-        host=HOST,
-        port=PORT,
-        disk_device=DISK_DEVICE,
-        auth_token=SECRET_AUTH_TOKEN
-    )
-    server.start()
+    # Ensure you have server.crt and server.key in the same directory,
+    # or provide the full paths.
+    try:
+        server = DiskStreamerServer(
+            host=HOST,
+            port=PORT,
+            certfile='fullchain.pem', 
+            keyfile='privkey.pem',
+            disk_device=DISK_DEVICE,
+            auth_token=SECRET_AUTH_TOKEN
+        )
+        server.start()
+    except FileNotFoundError:
+        print("\FATAL: SSL certificate or key file not found. Ensure 'server.crt' and 'server.key' exist.")
+        sys.exit(1)
